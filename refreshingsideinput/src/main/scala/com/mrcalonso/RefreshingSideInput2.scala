@@ -1,11 +1,11 @@
 package com.mrcalonso
 
+import com.google.api.client.json.jackson.JacksonFactory
 import com.google.api.services.bigquery.model.{TableReference, TableSchema}
+import com.mrcalonso.RefreshingSideInput2.PairType
 import com.spotify.scio.ContextAndArgs
-import com.spotify.scio.bigquery.BigQueryClient
-import com.spotify.scio.bigquery.BigQueryClient.{CACHE_ENABLED_KEY, PROJECT_KEY}
-import com.spotify.scio.values.WindowOptions
-import org.apache.beam.sdk.coders.StringUtf8Coder
+import com.spotify.scio.values.{SCollection, WindowOptions}
+import org.apache.beam.sdk.coders._
 import org.apache.beam.sdk.io.GenerateSequence
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers
 import org.apache.beam.sdk.transforms.DoFn.ProcessElement
@@ -23,66 +23,81 @@ object RefreshingSideInput2 {
 
   private val Log = LoggerFactory.getLogger(getClass)
 
+  type PairType = KV[String, java.lang.Iterable[String]]
+  private val DocTypeField = "doc_type"
+
   def main(cmdArgs: Array[String]): Unit = {
     val (sc, args) = ContextAndArgs(cmdArgs)
 
     val projectId = args("project")
     val subscription = args("subscription")
     val dataset = args("dataset")
+    val output = args("output")
+    val refreshFreq = args("refreshFreq").toInt
 
-    val schemasView = sc.customInput(
-      "Tick", GenerateSequence.from(0).withRate(1, Duration.standardMinutes(2))
-    ).withGlobalWindow(WindowOptions(
+    val ticks = sc.customInput(
+      "Tick", GenerateSequence.from(0).withRate(1, Duration.standardMinutes(refreshFreq))
+    )
+
+    val main = sc
+      .pubsubSubscriptionWithAttributes[String](s"projects/$projectId/subscriptions/$subscription")
+      .map(_._2(DocTypeField))
+      .map(t => Try(BigQueryHelpers.parseTableSpec(s"$projectId:$dataset.$t")))
+      .collect { case Success(ref) =>
+        ref
+      }
+
+    val bqSchemasRetriever = new LiveBQSchemasRetriever(projectId, dataset)
+
+    pair(ticks, main, bqSchemasRetriever)
+      .saveAsTextFile(output)
+
+    sc.close().waitUntilFinish()
+  }
+
+  def pair(ticks: SCollection[java.lang.Long], types: SCollection[TableReference],
+           bq: BQSchemasRetriever)
+  : SCollection[PairType] = {
+
+    val schemasView = ticks.withGlobalWindow(WindowOptions(
       trigger = Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()),
       accumulationMode = AccumulationMode.DISCARDING_FIRED_PANES
     ))
       .flatMap { _ =>
-        Log.info("Retrieving schemas...")
-        sys.props(PROJECT_KEY) = projectId
-        sys.props(CACHE_ENABLED_KEY) = "false"
-        BigQueryClient.defaultInstance.getTables(projectId, dataset).map { tbl =>
-          Log.debug(s"Retrieving schema for ${tbl.getTableId}")
-          KV.of(tbl, BigQueryClient.defaultInstance.getTableSchema(tbl))
+        bq.getSchemas.map { case (ref, schema) =>
+          KV.of(ref, schema)
         }
       }.internal
       .apply(View.asMultimap[TableReference, TableSchema]())
 
-    sc
-      .pubsubSubscriptionWithAttributes[String](s"projects/$projectId/subscriptions/$subscription")
-      .internal.apply(ParDo.of[(String, Map[String, String]), String]
-      (new SchemaAssigner(schemasView, projectId, dataset)).withSideInputs(schemasView))
-      .setCoder(StringUtf8Coder.of())
+    val strings = types.internal.apply(ParDo.of[TableReference, PairType]
+      (new SchemaAssigner(schemasView)).withSideInputs(schemasView))
+      .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())))
 
-    sc.close().waitUntilFinish()
+    types.context.wrap(strings)
   }
 }
 
 class SchemaAssigner(schemasSide:
                      PCollectionView[java.util.Map[TableReference,
-                       java.lang.Iterable[TableSchema]]], projectId: String, dataset: String)
-  extends DoFn[(String, Map[String, String]), String] {
+                       java.lang.Iterable[TableSchema]]])
+  extends DoFn[TableReference, PairType] {
 
   private val Log = LoggerFactory.getLogger(getClass)
 
-  private val DocTypeField = "doc_type"
-
   @ProcessElement
-  def processElement(ctx: DoFn[(String, Map[String, String]), String]#ProcessContext): Unit = {
-    val msgWithAttrs = ctx.element()
+  def processElement(ctx: DoFn[TableReference, PairType]#ProcessContext): Unit = {
     val schemasInst = ctx.sideInput(schemasSide).asScala
-    typeToTableSpec(projectId, dataset, msgWithAttrs._2(DocTypeField)) match {
-      case Success(tRef) =>
-        schemasInst.get(tRef) match {
-          case Some(schema) =>
-            Log.debug(s"Current schemas side has ${schemasInst.keys.size} keys")
-            Log.info(s"Found schema for doc_type: ${tRef.getTableId} with ${schema.asScala.size} " +
-              s"versions. Last version has ${schema.asScala.last.getFields.size()} fields")
-          case _ =>
-        }
+    val tRef = ctx.element()
+    schemasInst.get(tRef) match {
+      case Some(schema) =>
+        Log.info(s"Found schema for doc_type: ${tRef.getTableId} with ${schema.asScala.size} " +
+          s"versions. Last version has ${schema.asScala.last.getFields.size()} fields")
+        ctx.output(KV.of(tRef.getTableId, schema.asScala.map { s =>
+          s.setFactory(new JacksonFactory)
+          s.toString
+        }.asJava))
       case _ =>
     }
   }
-
-  private def typeToTableSpec(project: String, dataset: String, str: String): Try[TableReference] =
-    Try(BigQueryHelpers.parseTableSpec(s"$project:$dataset.$str"))
 }
