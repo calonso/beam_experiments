@@ -1,13 +1,13 @@
 package com.mrcalonso
 
-import com.google.api.services.bigquery.model.TableReference
-import com.spotify.scio.ContextAndArgs
-import com.spotify.scio.bigquery.BigQueryClient
-import com.spotify.scio.bigquery.BigQueryClient.{CACHE_ENABLED_KEY, PROJECT_KEY}
-import com.spotify.scio.values.WindowOptions
+import com.google.api.services.bigquery.model.{TableReference, TableSchema}
+import com.spotify.scio.ScioContext
+import com.spotify.scio.values.{SCollection, WindowOptions}
 import org.apache.beam.sdk.io.GenerateSequence
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers
+import org.apache.beam.sdk.options.PipelineOptionsFactory
 import org.apache.beam.sdk.transforms.windowing.{AfterProcessingTime, Repeatedly}
+import org.apache.beam.sdk.values.KV
 import org.apache.beam.sdk.values.WindowingStrategy.AccumulationMode
 import org.joda.time.Duration
 import org.slf4j.LoggerFactory
@@ -20,50 +20,67 @@ object RefreshingSideInput {
 
   private val DocTypeField = "doc_type"
 
+  type SchemasList = KV[TableReference, Iterable[TableSchema]]
+
   def main(cmdlineArgs: Array[String]): Unit = {
-    val (sc, args) = ContextAndArgs(cmdlineArgs)
+    val opts = PipelineOptionsFactory
+      .fromArgs(cmdlineArgs: _*)
+      .withValidation()
+      .as(classOf[RefreshingSideInputOptions])
+    val sc = ScioContext(opts)
 
-    val projectId = args("project")
-    val subscription = args("subscription")
-    val dataset = args("dataset")
+    val projectId = opts.getProject
+    val subscription = opts.getSubscription
+    val dataset = opts.getDataset
+    val refreshFreq = opts.getRefreshFreq
 
-    val schemas = sc.customInput(
-      "Tick", GenerateSequence.from(0).withRate(1, Duration.standardMinutes(2))
-    ).withGlobalWindow(WindowOptions(
-      trigger = Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()),
-      accumulationMode = AccumulationMode.DISCARDING_FIRED_PANES
-    ))
-      .flatMap { _ =>
-        Log.info("Retrieving schemas...")
-        sys.props(PROJECT_KEY) = projectId
-        sys.props(CACHE_ENABLED_KEY) = "false"
-        BigQueryClient.defaultInstance.getTables(projectId, dataset).map { tbl =>
-          Log.debug(s"Retrieving schema for ${tbl.getTableId}")
-          (tbl, BigQueryClient.defaultInstance.getTableSchema(tbl))
-        }
-      }.asMultiMapSideInput
+    val ticks = sc.customInput(
+      "Tick", GenerateSequence.from(0).withRate(1, Duration.standardMinutes(refreshFreq))
+    )
 
-    sc
+    val main = sc
       .pubsubSubscriptionWithAttributes[String](s"projects/$projectId/subscriptions/$subscription")
-      .withSideInputs(schemas)
-      .map { case (msgWithAttrs, sideCtx) =>
-        typeToTableSpec(projectId, dataset, msgWithAttrs._2(DocTypeField)) match {
-          case Success(tRef) =>
-            val schemasInst = sideCtx(schemas)
-            schemasInst.get(tRef) match {
-              case Some(schema) =>
-                Log.debug(s"Current schemas side has ${schemasInst.keys.size} keys")
-                Log.info(s"Found schema for doc_type: ${tRef.getTableId} with ${schema.size} " +
-                  s"versions. Last version has ${schema.last.getFields.size()} fields")
-              case _ =>
-            }
-          case _ =>
-        }
+      .map(_._2(DocTypeField))
+      .map(t => Try(BigQueryHelpers.parseTableSpec(s"$projectId:$dataset.$t")))
+      .collect { case Success(ref) =>
+        ref
       }
+
+    val bqSchemasRetriever = new LiveBQSchemasRetriever(projectId, dataset)
+
+    pair(ticks, main, bqSchemasRetriever)
 
     sc.close().waitUntilFinish()
   }
 
-  private def typeToTableSpec(project: String, dataset: String, str: String): Try[TableReference] =
-    Try(BigQueryHelpers.parseTableSpec(s"$project:$dataset.$str"))
+  def pair(ticks: SCollection[java.lang.Long],
+           main: SCollection[TableReference], bq: BQSchemasRetriever)
+  : SCollection[SchemasList] = {
+    val schemasSide = buildSchemasCollection(ticks, bq).asMultiMapSideInput
+
+    main.withSideInputs(schemasSide)
+      .flatMap { case (tRef, sideCtx) =>
+        val schemasInst = sideCtx(schemasSide)
+        schemasInst.get(tRef) match {
+          case Some(schemas) =>
+            Log.info(s"Found schema for doc_type: ${tRef.getTableId} with ${schemas.size} " +
+              s"versions. Versions have ${schemas.map(_.getFields.size()).mkString(", ")} fields")
+            Some(KV.of(tRef, schemas))
+          case _ => None
+        }
+      }.toSCollection
+  }
+
+  def buildSchemasCollection(ticks: SCollection[java.lang.Long], bq: BQSchemasRetriever)
+  : SCollection[(TableReference, TableSchema)] = {
+    ticks.withGlobalWindow(WindowOptions(
+      trigger = Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()),
+      accumulationMode = AccumulationMode.DISCARDING_FIRED_PANES
+    ))
+      .flatMap { _ =>
+        bq.getSchemas.map { case (ref, schema) =>
+          (ref, schema)
+        }
+      }
+  }
 }
