@@ -3,6 +3,7 @@ package com.mrcalonso
 import com.google.api.client.json.jackson.JacksonFactory
 import com.google.api.services.bigquery.model.{TableReference, TableSchema}
 import com.mrcalonso.RefreshingSideInput2.PairType
+import com.mrcalonso.coders.GenericJsonCoder
 import com.spotify.scio.ContextAndArgs
 import com.spotify.scio.values.{SCollection, WindowOptions}
 import org.apache.beam.sdk.coders._
@@ -12,7 +13,7 @@ import org.apache.beam.sdk.transforms.DoFn.ProcessElement
 import org.apache.beam.sdk.transforms.windowing.{AfterProcessingTime, Repeatedly}
 import org.apache.beam.sdk.transforms.{DoFn, ParDo, View}
 import org.apache.beam.sdk.values.WindowingStrategy.AccumulationMode
-import org.apache.beam.sdk.values.{KV, PCollectionView}
+import org.apache.beam.sdk.values.{KV, PCollection, PCollectionView}
 import org.joda.time.Duration
 import org.slf4j.LoggerFactory
 
@@ -59,7 +60,19 @@ object RefreshingSideInput2 {
            bq: BQSchemasRetriever)
   : SCollection[PairType] = {
 
-    val schemasView = ticks.withGlobalWindow(WindowOptions(
+    val schemasView = buildSchemasView(ticks, bq)
+      .apply(View.asMultimap[TableReference, TableSchema]())
+
+    val strings = types.internal.apply(ParDo.of[TableReference, PairType]
+      (new SchemaAssigner(schemasView)).withSideInputs(schemasView))
+      .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())))
+
+    types.context.wrap(strings)
+  }
+
+  def buildSchemasView(ticks: SCollection[java.lang.Long], bq: BQSchemasRetriever)
+  : PCollection[KV[TableReference, TableSchema]] = {
+    ticks.withGlobalWindow(WindowOptions(
       trigger = Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()),
       accumulationMode = AccumulationMode.DISCARDING_FIRED_PANES
     ))
@@ -68,13 +81,8 @@ object RefreshingSideInput2 {
           KV.of(ref, schema)
         }
       }.internal
-      .apply(View.asMultimap[TableReference, TableSchema]())
-
-    val strings = types.internal.apply(ParDo.of[TableReference, PairType]
-      (new SchemaAssigner(schemasView)).withSideInputs(schemasView))
-      .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())))
-
-    types.context.wrap(strings)
+      .setCoder(KvCoder.of(GenericJsonCoder.of(classOf[TableReference]),
+        GenericJsonCoder.of(classOf[TableSchema])))
   }
 }
 
