@@ -1,0 +1,12 @@
+[
+  {
+    "type": "INTEGER",
+    "name": "journey_id",
+    "mode": "NULLABLE"
+  },
+  {
+    "type": "INTEGER",
+    "name": "dummy",
+    "mode": "NULLABLE"
+  }
+]

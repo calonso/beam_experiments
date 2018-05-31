@@ -4,11 +4,12 @@ import com.google.api.client.json.jackson.JacksonFactory
 import com.google.api.services.bigquery.model.{TableReference, TableSchema}
 import com.mrcalonso.RefreshingSideInput2.PairType
 import com.mrcalonso.coders.GenericJsonCoder
-import com.spotify.scio.ContextAndArgs
+import com.spotify.scio.ScioContext
 import com.spotify.scio.values.{SCollection, WindowOptions}
 import org.apache.beam.sdk.coders._
 import org.apache.beam.sdk.io.GenerateSequence
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers
+import org.apache.beam.sdk.options.PipelineOptionsFactory
 import org.apache.beam.sdk.transforms.DoFn.ProcessElement
 import org.apache.beam.sdk.transforms.windowing.{AfterProcessingTime, Repeatedly}
 import org.apache.beam.sdk.transforms.{DoFn, ParDo, View}
@@ -28,13 +29,16 @@ object RefreshingSideInput2 {
   private val DocTypeField = "doc_type"
 
   def main(cmdArgs: Array[String]): Unit = {
-    val (sc, args) = ContextAndArgs(cmdArgs)
+    val opts = PipelineOptionsFactory
+      .fromArgs(cmdArgs: _*)
+      .withValidation()
+      .as(classOf[RefreshingSideInputOptions])
+    val sc = ScioContext(opts)
 
-    val projectId = args("project")
-    val subscription = args("subscription")
-    val dataset = args("dataset")
-    val output = args("output")
-    val refreshFreq = args("refreshFreq").toInt
+    val projectId = opts.getProject
+    val subscription = opts.getSubscription
+    val dataset = opts.getDataset
+    val refreshFreq = opts.getRefreshFreq
 
     val ticks = sc.customInput(
       "Tick", GenerateSequence.from(0).withRate(1, Duration.standardMinutes(refreshFreq))
@@ -51,7 +55,6 @@ object RefreshingSideInput2 {
     val bqSchemasRetriever = new LiveBQSchemasRetriever(projectId, dataset)
 
     pair(ticks, main, bqSchemasRetriever)
-      .saveAsTextFile(output)
 
     sc.close().waitUntilFinish()
   }
@@ -74,7 +77,7 @@ object RefreshingSideInput2 {
   : PCollection[KV[TableReference, TableSchema]] = {
     ticks.withGlobalWindow(WindowOptions(
       trigger = Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()),
-      accumulationMode = AccumulationMode.DISCARDING_FIRED_PANES
+      accumulationMode = AccumulationMode.ACCUMULATING_FIRED_PANES
     ))
       .flatMap { _ =>
         bq.getSchemas.map { case (ref, schema) =>
@@ -100,7 +103,8 @@ class SchemaAssigner(schemasSide:
     schemasInst.get(tRef) match {
       case Some(schema) =>
         Log.info(s"Found schema for doc_type: ${tRef.getTableId} with ${schema.asScala.size} " +
-          s"versions. Last version has ${schema.asScala.last.getFields.size()} fields")
+          s"versions. Versions have ${schema.asScala.map(_.getFields.size()).mkString(", ")} " +
+          s"fields")
         ctx.output(KV.of(tRef.getTableId, schema.asScala.map { s =>
           s.setFactory(new JacksonFactory)
           s.toString

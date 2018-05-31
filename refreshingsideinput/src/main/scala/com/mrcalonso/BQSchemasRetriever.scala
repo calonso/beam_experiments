@@ -19,7 +19,8 @@ trait BQSchemasRetriever {
   protected def getTableSchema(ref: TableReference): TableSchema
 }
 
-class LiveBQSchemasRetriever(projectId: String, dataset: String) extends BQSchemasRetriever {
+class LiveBQSchemasRetriever(projectId: String, dataset: String)
+  extends BQSchemasRetriever with Serializable {
 
   private lazy val BQ = {
     sys.props(PROJECT_KEY) = projectId
