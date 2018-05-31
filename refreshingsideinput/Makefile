@@ -1,7 +1,6 @@
 prefix = $(shell whoami)_
 dataset = $(prefix)temp
-project =
-topic =
+project = $(shell gcloud config list --format 'value(core.project)')
 schemas = $(wildcard ./src/main/resources/schemas/*.json)
 schema_files = $(basename $(notdir $(schemas)))
 vpath %.json ./src/main/resources/schemas
@@ -26,7 +25,8 @@ run_pcollection:
 
 .PHONY: create_test_subscription
 create_test_subscription:
-	gcloud beta pubsub subscriptions create $(prefix)rsi-test --topic projects/$(project)/topics/$(topic)
+	@read -p "Enter topic name:" topic; \
+	gcloud beta pubsub subscriptions create $(prefix)rsi-test --topic projects/$(project)/topics/$$topic
 
 .PHONY: delete_test_subscription
 delete_test_subscription:
